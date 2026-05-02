@@ -178,12 +178,13 @@ export async function runClaudeScan(
     max_tokens: 4000,
     // Prompt caching: mark the system prompt with cache_control so Anthropic caches it
     // after the first call. Subsequent calls pay only ~10% of the system prompt input cost.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     system: [
       {
         type: "text",
         text: SKILL_SYSTEM_PROMPT,
         cache_control: { type: "ephemeral" },
-      },
+      } as any,
     ],
     messages: [{ role: "user", content: userMessage }],
   });
