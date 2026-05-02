@@ -1,0 +1,9 @@
+{
+  "functions": {
+    "app/api/scan/route.ts": { "maxDuration": 60 },
+    "app/api/parse-oi-screenshot/route.ts": { "maxDuration": 30 },
+    "app/api/advance-decline/route.ts": { "maxDuration": 30 },
+    "app/api/options-chain/route.ts": { "maxDuration": 20 },
+    "app/api/breeze/route.ts": { "maxDuration": 20 }
+  }
+}
