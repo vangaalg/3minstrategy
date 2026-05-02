@@ -18,6 +18,8 @@ import { MarketTicker } from "@/components/MarketTicker";
 import { SettingsPanel, useSettings } from "@/components/SettingsPanel";
 import { OIScreenshotUploader, useUploadedChain } from "@/components/OIScreenshotUploader";
 import type { UploadedChainData } from "@/components/OIScreenshotUploader";
+import { CSVUploader, useUploadedCSV } from "@/components/CSVUploader";
+import type { UploadedCSVData } from "@/components/CSVUploader";
 
 interface ChainMeta {
   source: "breeze" | "upload" | "none";
@@ -44,6 +46,7 @@ interface ScanResponse {
 export default function Home() {
   const { settings, save: saveSettings } = useSettings();
   const { data: uploadedChain, save: saveUploadedChain } = useUploadedChain();
+  const { data: uploadedCSV, save: saveUploadedCSV } = useUploadedCSV();
   const [showUploader, setShowUploader] = useState(false);
   const [data, setData] = useState<ScanResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -60,15 +63,22 @@ export default function Home() {
     const sessionToken = overrideToken ?? settings.sessionToken;
 
     try {
+      // Priority: uploaded CSV > uploaded screenshot > Breeze
+      // CSV is structured and accurate; screenshot is OCR-based; Breeze is live API
+      const chainToSend = uploadedCSV?.chain ?? uploadedChain?.chain;
+      const chainSource = uploadedCSV ? "csv" : uploadedChain ? "screenshot" : null;
+      const chainAt     = uploadedCSV?.uploaded_at ?? uploadedChain?.uploaded_at;
+
       const res = await fetch("/api/scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model,
           sessionToken,
-          uploadedChain: uploadedChain?.chain,
-          uploadedAt:    uploadedChain?.uploaded_at,
-          preferUpload:  settings.preferUpload === true,
+          uploadedChain: chainToSend,
+          uploadedAt:    chainAt,
+          uploadSource:  chainSource,
+          preferUpload:  settings.preferUpload === true || !!chainToSend,
         }),
       });
       const json: ScanResponse = await res.json();
@@ -156,18 +166,20 @@ export default function Home() {
           className={`oi-source-pill ${
             data?.chain_meta?.source === "upload" ? "upload" :
             data?.chain_meta?.source === "breeze" ? "breeze" :
-            uploadedChain ? "ready" : "idle"
+            (uploadedCSV || uploadedChain) ? "ready" : "idle"
           }`}
           onClick={() => setShowUploader((v) => !v)}
-          title="Upload OI screenshot as fallback for Breeze"
+          title="Upload OI CSV (recommended) or screenshot as fallback for Breeze"
         >
           {data?.chain_meta?.source === "upload"
-            ? `📊 Screenshot (${data.chain_meta.strikes_count})`
+            ? `📄 ${uploadedCSV ? "CSV" : "Screenshot"} (${data.chain_meta.strikes_count})`
             : data?.chain_meta?.source === "breeze"
               ? `🔌 Breeze (${data.chain_meta.strikes_count})`
-              : uploadedChain
-                ? `📊 Upload ready (${uploadedChain.chain.length})`
-                : "📊 Upload OI"}
+              : uploadedCSV
+                ? `📄 CSV ready (${uploadedCSV.chain.length})`
+                : uploadedChain
+                  ? `📊 Screenshot ready (${uploadedChain.chain.length})`
+                  : "📄 Upload OI"}
         </button>
 
         {/* Prompt cache status from last scan */}
@@ -184,15 +196,17 @@ export default function Home() {
         </div>
       </div>
 
-      {/* OI screenshot uploader — collapsible panel */}
+      {/* OI Upload panel — collapsible. Two methods: CSV (preferred) or screenshot */}
       {showUploader && (
         <div className="oi-upload-panel">
           <div className="oi-upload-panel-header">
             <div>
-              <div className="oi-upload-title">OI Screenshot Upload</div>
+              <div className="oi-upload-title">OI Data Upload</div>
               <div className="oi-upload-hint">
-                Use when Breeze options chain fetch fails or you want to override with a snapshot from NSE / Sensibull / Opstra / your broker terminal.
-                Parsed via Claude Vision into a strike table and used in the next scan.
+                Use when Breeze fails or markets are closed. Two methods:
+                <strong> CSV</strong> (recommended — structured, accurate, instant) or
+                <strong> Screenshot</strong> (parsed via Claude Vision).
+                If both are uploaded, CSV is used. Re-upload every 15 min during market hours for fresh OI signal.
               </div>
             </div>
             <button className="modal-close" onClick={() => setShowUploader(false)}>✕</button>
@@ -206,19 +220,43 @@ export default function Home() {
                 onChange={(e) => saveSettings({ ...settings, preferUpload: e.target.checked })}
               />
               <span>
-                <strong>Prefer screenshot over Breeze</strong>
+                <strong>Always prefer upload over Breeze</strong>
                 <span className="oi-upload-toggle-hint">
-                  When checked, scans always use the uploaded screenshot, even if Breeze is working.
-                  Otherwise, screenshot is only used when Breeze fails.
+                  When checked, scans always use uploaded data, even if Breeze works.
+                  Otherwise, upload is used only when Breeze fails or no upload is fresher.
                 </span>
               </span>
             </label>
           </div>
 
-          <OIScreenshotUploader
-            onParsed={(d) => { /* state already saved in component via useUploadedChain */ }}
-            onCleared={() => { /* component handles localStorage clear */ }}
-          />
+          {/* CSV uploader (primary) */}
+          <div className="oi-upload-section">
+            <div className="oi-upload-section-title">
+              <span className="oi-upload-section-num">1</span>
+              CSV from NSE Option Chain · recommended
+            </div>
+            <CSVUploader
+              onParsed={() => { /* state saved in component via useUploadedCSV */ }}
+              onCleared={() => { /* component handles localStorage */ }}
+            />
+          </div>
+
+          {/* Divider */}
+          <div className="oi-upload-divider">
+            <span>OR</span>
+          </div>
+
+          {/* Screenshot uploader (fallback) */}
+          <div className="oi-upload-section">
+            <div className="oi-upload-section-title">
+              <span className="oi-upload-section-num">2</span>
+              Screenshot of any options chain · fallback
+            </div>
+            <OIScreenshotUploader
+              onParsed={() => { /* state saved via useUploadedChain */ }}
+              onCleared={() => { /* component handles localStorage */ }}
+            />
+          </div>
         </div>
       )}
 

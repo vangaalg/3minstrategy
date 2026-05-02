@@ -43,7 +43,10 @@ function computeChecksum(timestamp: string, body: string, secret: string): strin
   return `token ${hash}`;
 }
 
-/** Send a Breeze API request. Body is the JSON request payload. */
+/** Send a Breeze API request. Body is the JSON request payload.
+ *  Note: Breeze docs use "GET" for read endpoints but require the body in the
+ *  request. Modern fetch (Undici on Node 20+) refuses body on GET, so we always
+ *  send POST when a body is present — Breeze accepts this for all read endpoints. */
 async function breezeRequest<T = any>(
   method: "GET" | "POST",
   endpoint: string,
@@ -54,9 +57,13 @@ async function breezeRequest<T = any>(
   const bodyStr = JSON.stringify(body);
   const checksum = computeChecksum(timestamp, bodyStr, apiSecret);
 
+  // Modern fetch refuses body on GET. Breeze accepts POST for read endpoints
+  // when a body is present, so we coerce to POST.
+  const httpMethod = body && Object.keys(body).length > 0 ? "POST" : method;
+
   const url = `${BREEZE_BASE_URL}${endpoint}`;
   const res = await fetch(url, {
-    method,
+    method: httpMethod,
     headers: {
       "Content-Type": "application/json",
       "X-Checksum": checksum,
@@ -64,7 +71,7 @@ async function breezeRequest<T = any>(
       "X-AppKey": apiKey,
       "X-SessionToken": encodeSessionToken(apiKey, sessionToken),
     },
-    body: method === "POST" || method === "GET" ? bodyStr : undefined,
+    body: bodyStr,
     cache: "no-store",
   });
 
