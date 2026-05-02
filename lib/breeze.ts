@@ -46,34 +46,48 @@ function computeChecksum(timestamp: string, body: string, secret: string): strin
 /** Send a Breeze API request. Body is the JSON request payload.
  *  Note: Breeze docs use "GET" for read endpoints but require the body in the
  *  request. Modern fetch (Undici on Node 20+) refuses body on GET, so we always
- *  send POST when a body is present — Breeze accepts this for all read endpoints. */
+ *  send POST when a body is present — Breeze accepts this for all read endpoints.
+ *  Hard 5s timeout per request to prevent the function from hanging on bad auth. */
 async function breezeRequest<T = any>(
   method: "GET" | "POST",
   endpoint: string,
-  body: Record<string, any>
+  body: Record<string, any>,
+  timeoutMs: number = 5000
 ): Promise<T> {
   const { apiKey, apiSecret, sessionToken } = getCreds();
   const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, ".000Z");
   const bodyStr = JSON.stringify(body);
   const checksum = computeChecksum(timestamp, bodyStr, apiSecret);
 
-  // Modern fetch refuses body on GET. Breeze accepts POST for read endpoints
-  // when a body is present, so we coerce to POST.
   const httpMethod = body && Object.keys(body).length > 0 ? "POST" : method;
 
   const url = `${BREEZE_BASE_URL}${endpoint}`;
-  const res = await fetch(url, {
-    method: httpMethod,
-    headers: {
-      "Content-Type": "application/json",
-      "X-Checksum": checksum,
-      "X-Timestamp": timestamp,
-      "X-AppKey": apiKey,
-      "X-SessionToken": encodeSessionToken(apiKey, sessionToken),
-    },
-    body: bodyStr,
-    cache: "no-store",
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: httpMethod,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Checksum": checksum,
+        "X-Timestamp": timestamp,
+        "X-AppKey": apiKey,
+        "X-SessionToken": encodeSessionToken(apiKey, sessionToken),
+      },
+      body: bodyStr,
+      cache: "no-store",
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if ((err as any)?.name === "AbortError") {
+      throw new Error(`Breeze ${endpoint} timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 
   if (!res.ok) {
     const text = await res.text();

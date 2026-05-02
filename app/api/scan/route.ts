@@ -124,17 +124,25 @@ export async function POST(req: Request) {
     const { fromISO, toISO } = getNSESessionRangeIST(now);
     const expiry = nextNiftyWeeklyExpiry(now);
 
+    // ── Probe 1-min bars first (fast, fails in 5s on bad auth) ──
+    // If Breeze auth is bust, A/D would otherwise spend 25-50s timing out 50 calls.
+    // We avoid that by gating A/D on the bars probe.
+    const [oneMinBars, barsErr] = await safe(fetchNifty1MinBars(fromISO, toISO));
+    const breezeAlive = oneMinBars !== null && oneMinBars.length > 0;
+
+    // ── If Breeze is alive, fetch chain + A/D in parallel. Otherwise skip both. ──
+    const chainP = (hasUpload && body.preferUpload) || !breezeAlive
+      ? Promise.resolve<[any[], string | null]>([[], null])
+      : safe(fetchNiftyOptionChain(expiry));
+
+    const adP = !breezeAlive
+      ? Promise.resolve<[any | null, string | null]>([null, "skipped (Breeze unreachable)"])
+      : safe(fetchAdvanceDecline());
+
     const [
-      [oneMinBars, barsErr],
       [breezeChain, chainErr],
       [adSnap, adErr],
-    ] = await Promise.all([
-      safe(fetchNifty1MinBars(fromISO, toISO)),
-      hasUpload && body.preferUpload
-        ? Promise.resolve<[any[], string | null]>([[], null])
-        : safe(fetchNiftyOptionChain(expiry)),
-      safe(fetchAdvanceDecline()),
-    ]);
+    ] = await Promise.all([chainP, adP]);
 
     // ── 1-min bars status ──
     let threeMinBars: ReturnType<typeof resample1MinTo3Min> = [];
