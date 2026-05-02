@@ -20,6 +20,7 @@ import { OIScreenshotUploader, useUploadedChain } from "@/components/OIScreensho
 import type { UploadedChainData } from "@/components/OIScreenshotUploader";
 import { CSVUploader, useUploadedCSV } from "@/components/CSVUploader";
 import type { UploadedCSVData } from "@/components/CSVUploader";
+import { DataSourcesPanel } from "@/components/DataSourcesPanel";
 
 interface ChainMeta {
   source: "breeze" | "upload" | "none";
@@ -28,16 +29,26 @@ interface ChainMeta {
   strikes_count: number;
 }
 
+interface SourceStatus {
+  name: string;
+  status: "ok" | "failed" | "skipped";
+  detail: string;
+  count?: number;
+}
+
 interface ScanResponse {
   ok: boolean;
+  degraded?: boolean;
   timestamp?: string;
   bars_used?: number;
   total_3min_bars?: number;
-  result?: ScanOutput;
-  meta?: ScanMeta;
-  confluence?: ConfluenceReport;
+  data_sources?: SourceStatus[];
+  warnings?: string[];
+  result?: ScanOutput | null;
+  meta?: ScanMeta | null;
+  confluence?: ConfluenceReport | null;
   advance_decline?: AdvanceDeclineSnapshot | null;
-  strangle?: StrangleProposal;
+  strangle?: StrangleProposal | null;
   daily_structure?: DailyStructureSnapshot | null;
   chain_meta?: ChainMeta;
   error?: string;
@@ -296,6 +307,15 @@ export default function Home() {
             </div>
           )}
         </div>
+      )}
+
+      {/* Data sources panel — always show when we have any scan response */}
+      {data?.data_sources && (
+        <DataSourcesPanel
+          sources={data.data_sources}
+          warnings={data.warnings}
+          degraded={data.degraded}
+        />
       )}
 
       {data?.result && (
