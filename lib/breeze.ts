@@ -1,22 +1,30 @@
 /**
  * ICICI Breeze REST API client.
  *
- * Auth model: every request includes headers:
- *   X-AppKey            = API key
- *   X-SessionToken      = base64-encoded session token (the apisession from daily login)
- *   X-Checksum          = "token " + SHA256(timeStamp + JSON.stringify(body) + secret)
- *   X-Timestamp         = ISO 8601 UTC timestamp e.g. "2026-05-02T08:30:00.000Z"
+ * Auth model (ALL requests including GET):
+ *   X-AppKey        = API key
+ *   X-SessionToken  = base64("apiKey:sessionToken")
+ *   X-Checksum      = "token " + SHA256(timestamp + JSON.stringify(body) + secret)
+ *   X-Timestamp     = ISO 8601 UTC e.g. "2026-05-04T09:15:00.000Z"
  *
- * FIX (2026-05-04): Breeze /historicalcharts does NOT accept POST — returns 405.
- * All GET endpoints now send params as URL query string, not as request body.
- * Only true write/action endpoints (if any) use POST with a body.
+ * IMPORTANT — Breeze's quirk:
+ *   /historicalcharts, /optionchain, /quotes are all declared as GET in the docs,
+ *   BUT they require the params as a JSON body (not query string).
+ *   Standard fetch/Undici on Node 20 silently drops body on GET.
+ *   FIX: use method "GET" but send via http.request (Node built-in) with body,
+ *   OR simply use POST — but Breeze returns 405 on POST for these endpoints.
+ *   REAL FIX: use the `undici` dispatcher trick: pass body with GET via
+ *   a custom dispatcher that allows body on GET.
+ *   SIMPLEST FIX that actually works: use Node's `https` module directly.
  *
  * Docs: https://api.icicidirect.com/breezeapi/documents/index.html
  */
 
 import { createHash } from "crypto";
+import https from "https";
 
-const BREEZE_BASE_URL = "https://api.icicidirect.com/breezeapi/api/v1";
+const BREEZE_BASE_HOST = "api.icicidirect.com";
+const BREEZE_BASE_PATH = "/breezeapi/api/v1";
 
 interface BreezeCreds {
   apiKey: string;
@@ -36,120 +44,78 @@ function getCreds(): BreezeCreds {
   return { apiKey, apiSecret, sessionToken };
 }
 
-/** Encode session token as base64 (Breeze expects base64 of "apiKey:sessionToken"). */
 function encodeSessionToken(apiKey: string, sessionToken: string): string {
   return Buffer.from(`${apiKey}:${sessionToken}`).toString("base64");
 }
 
-function computeChecksum(timestamp: string, body: string, secret: string): string {
-  const raw = timestamp + body + secret;
+function computeChecksum(timestamp: string, bodyStr: string, secret: string): string {
+  const raw = timestamp + bodyStr + secret;
   const hash = createHash("sha256").update(raw).digest("hex");
   return `token ${hash}`;
 }
 
 /**
- * Send a Breeze GET request with params as query string.
- * Checksum is computed over an empty body string "" (no body on GET).
+ * Make a Breeze API request using Node's https module directly.
+ * This allows sending a JSON body with GET (which fetch/Undici blocks on Node 20+).
+ * Breeze's GET endpoints require the payload in the request body, not the query string.
  */
-async function breezeGet<T = any>(
-  endpoint: string,
-  params: Record<string, any>,
-  timeoutMs: number = 8000
-): Promise<T> {
-  const { apiKey, apiSecret, sessionToken } = getCreds();
-  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, ".000Z");
-
-  // GET requests: checksum over empty body
-  const checksum = computeChecksum(timestamp, "", apiSecret);
-
-  // Build query string
-  const qs = new URLSearchParams(
-    Object.entries(params).map(([k, v]) => [k, String(v)])
-  ).toString();
-  const url = `${BREEZE_BASE_URL}${endpoint}?${qs}`;
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  let res: Response;
-  try {
-    res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Checksum": checksum,
-        "X-Timestamp": timestamp,
-        "X-AppKey": apiKey,
-        "X-SessionToken": encodeSessionToken(apiKey, sessionToken),
-      },
-      cache: "no-store",
-      signal: controller.signal,
-    });
-  } catch (err) {
-    if ((err as any)?.name === "AbortError") {
-      throw new Error(`Breeze ${endpoint} timed out after ${timeoutMs}ms`);
-    }
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Breeze ${endpoint} failed: ${res.status} ${text}`);
-  }
-
-  return res.json() as Promise<T>;
-}
-
-/**
- * Send a Breeze POST request with JSON body.
- * Only use this for endpoints that genuinely require POST (write/action endpoints).
- */
-async function breezePost<T = any>(
+function breezeRequest<T = any>(
+  method: "GET" | "POST",
   endpoint: string,
   body: Record<string, any>,
-  timeoutMs: number = 8000
+  timeoutMs = 8000
 ): Promise<T> {
   const { apiKey, apiSecret, sessionToken } = getCreds();
   const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, ".000Z");
   const bodyStr = JSON.stringify(body);
   const checksum = computeChecksum(timestamp, bodyStr, apiSecret);
 
-  const url = `${BREEZE_BASE_URL}${endpoint}`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "X-Checksum": checksum,
+    "X-Timestamp": timestamp,
+    "X-AppKey": apiKey,
+    "X-SessionToken": encodeSessionToken(apiKey, sessionToken),
+    "Content-Length": Buffer.byteLength(bodyStr).toString(),
+  };
 
-  let res: Response;
-  try {
-    res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Checksum": checksum,
-        "X-Timestamp": timestamp,
-        "X-AppKey": apiKey,
-        "X-SessionToken": encodeSessionToken(apiKey, sessionToken),
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: BREEZE_BASE_HOST,
+        path: `${BREEZE_BASE_PATH}${endpoint}`,
+        method,
+        headers,
+        timeout: timeoutMs,
       },
-      body: bodyStr,
-      cache: "no-store",
-      signal: controller.signal,
+      (res) => {
+        let data = "";
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () => {
+          if (res.statusCode && res.statusCode >= 400) {
+            reject(new Error(`Breeze ${endpoint} failed: ${res.statusCode} ${data}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(data) as T);
+          } catch {
+            reject(new Error(`Breeze ${endpoint} invalid JSON: ${data}`));
+          }
+        });
+      }
+    );
+
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error(`Breeze ${endpoint} timed out after ${timeoutMs}ms`));
     });
-  } catch (err) {
-    if ((err as any)?.name === "AbortError") {
-      throw new Error(`Breeze ${endpoint} timed out after ${timeoutMs}ms`);
-    }
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Breeze ${endpoint} failed: ${res.status} ${text}`);
-  }
+    req.on("error", (err) => reject(err));
 
-  return res.json() as Promise<T>;
+    // Write body — works on GET too via Node's https module
+    req.write(bodyStr);
+    req.end();
+  });
 }
 
 // ============================================================================
@@ -157,7 +123,7 @@ async function breezePost<T = any>(
 // ============================================================================
 
 export interface BreezeBar {
-  datetime: string; // ISO timestamp from Breeze
+  datetime: string;
   open: number;
   high: number;
   low: number;
@@ -172,56 +138,44 @@ export interface BreezeHistoricalResponse {
 }
 
 /**
- * Fetch historical 1-min OHLCV for the Nifty 50 index.
- * Uses GET with query params (POST returns 405 on /historicalcharts).
+ * Fetch historical 1-min OHLCV for Nifty 50.
+ * Uses GET with JSON body (Breeze's non-standard convention).
  */
 export async function fetchNifty1MinBars(
   fromDate: string,
   toDate: string
 ): Promise<BreezeBar[]> {
-  const resp = await breezeGet<BreezeHistoricalResponse>(
-    "/historicalcharts",
-    {
-      interval: "1minute",
-      from_date: fromDate,
-      to_date: toDate,
-      stock_code: "NIFTY",
-      exchange_code: "NSE",
-      product_type: "cash",
-    }
-  );
+  const resp = await breezeRequest<BreezeHistoricalResponse>("GET", "/historicalcharts", {
+    interval: "1minute",
+    from_date: fromDate,
+    to_date: toDate,
+    stock_code: "NIFTY",
+    exchange_code: "NSE",
+    product_type: "cash",
+  });
 
-  if (resp.Error) {
-    throw new Error(`Breeze historical charts error: ${resp.Error}`);
-  }
-
+  if (resp.Error) throw new Error(`Breeze historical charts error: ${resp.Error}`);
   return resp.Success ?? [];
 }
 
 /**
- * Fetch historical daily OHLCV for the Nifty 50 index.
+ * Fetch historical daily OHLCV for Nifty 50.
  * Used by the daily structure analyzer for HH/HL/LH/LL regime classification.
  */
 export async function fetchNiftyDailyBars(
   fromDate: string,
   toDate: string
 ): Promise<BreezeBar[]> {
-  const resp = await breezeGet<BreezeHistoricalResponse>(
-    "/historicalcharts",
-    {
-      interval: "1day",
-      from_date: fromDate,
-      to_date: toDate,
-      stock_code: "NIFTY",
-      exchange_code: "NSE",
-      product_type: "cash",
-    }
-  );
+  const resp = await breezeRequest<BreezeHistoricalResponse>("GET", "/historicalcharts", {
+    interval: "1day",
+    from_date: fromDate,
+    to_date: toDate,
+    stock_code: "NIFTY",
+    exchange_code: "NSE",
+    product_type: "cash",
+  });
 
-  if (resp.Error) {
-    throw new Error(`Breeze daily bars error: ${resp.Error}`);
-  }
-
+  if (resp.Error) throw new Error(`Breeze daily bars error: ${resp.Error}`);
   return resp.Success ?? [];
 }
 
@@ -242,14 +196,15 @@ export interface OptionChainRow {
 }
 
 /**
- * Fetch the Nifty options chain for a given expiry.
- * /optionchain also uses GET with query params.
+ * Fetch Nifty options chain for a given expiry.
+ * /optionchain also uses GET with JSON body.
  */
 export async function fetchNiftyOptionChain(
   expiryDate: string
 ): Promise<OptionChainRow[]> {
   const fetchSide = async (right: "call" | "put") => {
-    const resp = await breezeGet<{ Success?: any[]; Error?: string }>(
+    const resp = await breezeRequest<{ Success?: any[]; Error?: string }>(
+      "GET",
       "/optionchain",
       {
         stock_code: "NIFTY",
@@ -295,7 +250,7 @@ export async function fetchNiftyOptionChain(
 }
 
 /**
- * Compute the next Thursday's weekly expiry (Nifty weekly expiry day).
+ * Compute the next Thursday weekly expiry for Nifty.
  */
 export function nextNiftyWeeklyExpiry(now: Date = new Date()): string {
   const d = new Date(now);
@@ -336,12 +291,10 @@ export interface AdvanceDeclineSnapshot {
   fetched_at: string;
 }
 
-/**
- * Fetch a single stock quote via Breeze /quotes endpoint (GET).
- */
 async function fetchOneQuote(breezeCode: string): Promise<{ ltp: number; prev: number } | null> {
   try {
-    const resp = await breezeGet<{ Success?: any[]; Error?: string }>(
+    const resp = await breezeRequest<{ Success?: any[]; Error?: string }>(
+      "GET",
       "/quotes",
       {
         stock_code: breezeCode,
@@ -353,7 +306,7 @@ async function fetchOneQuote(breezeCode: string): Promise<{ ltp: number; prev: n
     const data = resp.Success?.[0];
     if (!data) return null;
     return {
-      ltp:  Number(data.ltp ?? 0),
+      ltp: Number(data.ltp ?? 0),
       prev: Number(data.previous_close ?? 0),
     };
   } catch {
@@ -361,9 +314,6 @@ async function fetchOneQuote(breezeCode: string): Promise<{ ltp: number; prev: n
   }
 }
 
-/**
- * Fetch advance/decline snapshot for all Nifty 50 stocks.
- */
 export async function fetchAdvanceDecline(): Promise<AdvanceDeclineSnapshot> {
   const stocks = NIFTY_50_BREEZE_CODES;
   const CONCURRENCY = 10;
@@ -375,14 +325,7 @@ export async function fetchAdvanceDecline(): Promise<AdvanceDeclineSnapshot> {
       batch.map(async (s) => {
         const q = await fetchOneQuote(s.breeze);
         if (!q || q.prev <= 0) {
-          return {
-            symbol: s.symbol,
-            name: s.name,
-            ltp: null,
-            prev_close: null,
-            change_pct: null,
-            status: "error" as const,
-          };
+          return { symbol: s.symbol, name: s.name, ltp: null, prev_close: null, change_pct: null, status: "error" as const };
         }
         const change = q.ltp - q.prev;
         const changePct = (change / q.prev) * 100;
@@ -390,14 +333,7 @@ export async function fetchAdvanceDecline(): Promise<AdvanceDeclineSnapshot> {
         if (Math.abs(changePct) < 0.05) status = "unchanged";
         else if (change > 0) status = "advance";
         else status = "decline";
-        return {
-          symbol: s.symbol,
-          name: s.name,
-          ltp: q.ltp,
-          prev_close: q.prev,
-          change_pct: changePct,
-          status,
-        };
+        return { symbol: s.symbol, name: s.name, ltp: q.ltp, prev_close: q.prev, change_pct: changePct, status };
       })
     );
     quotes.push(...batchResults);
@@ -424,9 +360,7 @@ export async function fetchAdvanceDecline(): Promise<AdvanceDeclineSnapshot> {
   return {
     advances, declines, unchanged, errors, total,
     ratio: Math.round(ratio * 100) / 100,
-    bias,
-    top_gainers,
-    top_losers,
+    bias, top_gainers, top_losers,
     fetched_at: new Date().toISOString(),
   };
 }
