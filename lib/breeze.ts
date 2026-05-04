@@ -146,7 +146,7 @@ export async function fetchNifty1MinBars(
   toDate: string
 ): Promise<BreezeBar[]> {
   const resp = await breezeRequest<BreezeHistoricalResponse>("GET", "/historicalcharts", {
-    interval: "1minute",
+    interval: "minute",
     from_date: fromDate,
     to_date: toDate,
     stock_code: "NIFTY",
@@ -167,7 +167,7 @@ export async function fetchNiftyDailyBars(
   toDate: string
 ): Promise<BreezeBar[]> {
   const resp = await breezeRequest<BreezeHistoricalResponse>("GET", "/historicalcharts", {
-    interval: "1day",
+    interval: "day",
     from_date: fromDate,
     to_date: toDate,
     stock_code: "NIFTY",
