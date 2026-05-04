@@ -7,6 +7,10 @@
  *   X-Checksum          = "token " + SHA256(timeStamp + JSON.stringify(body) + secret)
  *   X-Timestamp         = ISO 8601 UTC timestamp e.g. "2026-05-02T08:30:00.000Z"
  *
+ * FIX (2026-05-04): Breeze /historicalcharts does NOT accept POST — returns 405.
+ * All GET endpoints now send params as URL query string, not as request body.
+ * Only true write/action endpoints (if any) use POST with a body.
+ *
  * Docs: https://api.icicidirect.com/breezeapi/documents/index.html
  */
 
@@ -43,23 +47,74 @@ function computeChecksum(timestamp: string, body: string, secret: string): strin
   return `token ${hash}`;
 }
 
-/** Send a Breeze API request. Body is the JSON request payload.
- *  Note: Breeze docs use "GET" for read endpoints but require the body in the
- *  request. Modern fetch (Undici on Node 20+) refuses body on GET, so we always
- *  send POST when a body is present — Breeze accepts this for all read endpoints.
- *  Hard 5s timeout per request to prevent the function from hanging on bad auth. */
-async function breezeRequest<T = any>(
-  method: "GET" | "POST",
+/**
+ * Send a Breeze GET request with params as query string.
+ * Checksum is computed over an empty body string "" (no body on GET).
+ */
+async function breezeGet<T = any>(
+  endpoint: string,
+  params: Record<string, any>,
+  timeoutMs: number = 8000
+): Promise<T> {
+  const { apiKey, apiSecret, sessionToken } = getCreds();
+  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, ".000Z");
+
+  // GET requests: checksum over empty body
+  const checksum = computeChecksum(timestamp, "", apiSecret);
+
+  // Build query string
+  const qs = new URLSearchParams(
+    Object.entries(params).map(([k, v]) => [k, String(v)])
+  ).toString();
+  const url = `${BREEZE_BASE_URL}${endpoint}?${qs}`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Checksum": checksum,
+        "X-Timestamp": timestamp,
+        "X-AppKey": apiKey,
+        "X-SessionToken": encodeSessionToken(apiKey, sessionToken),
+      },
+      cache: "no-store",
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if ((err as any)?.name === "AbortError") {
+      throw new Error(`Breeze ${endpoint} timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Breeze ${endpoint} failed: ${res.status} ${text}`);
+  }
+
+  return res.json() as Promise<T>;
+}
+
+/**
+ * Send a Breeze POST request with JSON body.
+ * Only use this for endpoints that genuinely require POST (write/action endpoints).
+ */
+async function breezePost<T = any>(
   endpoint: string,
   body: Record<string, any>,
-  timeoutMs: number = 5000
+  timeoutMs: number = 8000
 ): Promise<T> {
   const { apiKey, apiSecret, sessionToken } = getCreds();
   const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, ".000Z");
   const bodyStr = JSON.stringify(body);
   const checksum = computeChecksum(timestamp, bodyStr, apiSecret);
-
-  const httpMethod = body && Object.keys(body).length > 0 ? "POST" : method;
 
   const url = `${BREEZE_BASE_URL}${endpoint}`;
   const controller = new AbortController();
@@ -68,7 +123,7 @@ async function breezeRequest<T = any>(
   let res: Response;
   try {
     res = await fetch(url, {
-      method: httpMethod,
+      method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-Checksum": checksum,
@@ -118,31 +173,22 @@ export interface BreezeHistoricalResponse {
 
 /**
  * Fetch historical 1-min OHLCV for the Nifty 50 index.
- *
- * Breeze uses stock_code "NIFTY" with exchange_code "NSE" and product_type "cash" for the index.
- * Note: index historical data may be returned with volume=0 (indices don't have volume in the
- * traditional sense — Breeze sometimes returns the underlying contract's volume; treat with care).
- *
- * @param fromDate ISO date string e.g. "2026-05-02T09:15:00.000Z"
- * @param toDate ISO date string e.g. "2026-05-02T15:30:00.000Z"
+ * Uses GET with query params (POST returns 405 on /historicalcharts).
  */
 export async function fetchNifty1MinBars(
   fromDate: string,
   toDate: string
 ): Promise<BreezeBar[]> {
-  const body = {
-    interval: "1minute",
-    from_date: fromDate,
-    to_date: toDate,
-    stock_code: "NIFTY",
-    exchange_code: "NSE",
-    product_type: "cash",
-  };
-
-  const resp = await breezeRequest<BreezeHistoricalResponse>(
-    "GET",
+  const resp = await breezeGet<BreezeHistoricalResponse>(
     "/historicalcharts",
-    body
+    {
+      interval: "1minute",
+      from_date: fromDate,
+      to_date: toDate,
+      stock_code: "NIFTY",
+      exchange_code: "NSE",
+      product_type: "cash",
+    }
   );
 
   if (resp.Error) {
@@ -160,22 +206,22 @@ export async function fetchNiftyDailyBars(
   fromDate: string,
   toDate: string
 ): Promise<BreezeBar[]> {
-  const body = {
-    interval: "1day",
-    from_date: fromDate,
-    to_date: toDate,
-    stock_code: "NIFTY",
-    exchange_code: "NSE",
-    product_type: "cash",
-  };
-  const resp = await breezeRequest<BreezeHistoricalResponse>(
-    "GET",
+  const resp = await breezeGet<BreezeHistoricalResponse>(
     "/historicalcharts",
-    body
+    {
+      interval: "1day",
+      from_date: fromDate,
+      to_date: toDate,
+      stock_code: "NIFTY",
+      exchange_code: "NSE",
+      product_type: "cash",
+    }
   );
+
   if (resp.Error) {
     throw new Error(`Breeze daily bars error: ${resp.Error}`);
   }
+
   return resp.Success ?? [];
 }
 
@@ -186,34 +232,32 @@ export interface OptionChainRow {
   call_volume?: number;
   call_iv?: number;
   call_ltp?: number;
-  call_prev_close?: number;     // previous trading day's close LTP for the call
+  call_prev_close?: number;
   put_oi?: number;
   put_oi_change?: number;
   put_volume?: number;
   put_iv?: number;
   put_ltp?: number;
-  put_prev_close?: number;      // previous trading day's close LTP for the put
+  put_prev_close?: number;
 }
 
 /**
  * Fetch the Nifty options chain for a given expiry.
- * Breeze returns calls and puts as separate rows; we merge by strike here.
+ * /optionchain also uses GET with query params.
  */
 export async function fetchNiftyOptionChain(
-  expiryDate: string // e.g. "2026-05-08T06:00:00.000Z" — Thursday weekly expiry
+  expiryDate: string
 ): Promise<OptionChainRow[]> {
   const fetchSide = async (right: "call" | "put") => {
-    const body = {
-      stock_code: "NIFTY",
-      exchange_code: "NFO",
-      product_type: "options",
-      expiry_date: expiryDate,
-      right,
-    };
-    const resp = await breezeRequest<{ Success?: any[]; Error?: string }>(
-      "GET",
+    const resp = await breezeGet<{ Success?: any[]; Error?: string }>(
       "/optionchain",
-      body
+      {
+        stock_code: "NIFTY",
+        exchange_code: "NFO",
+        product_type: "options",
+        expiry_date: expiryDate,
+        right,
+      }
     );
     if (resp.Error) throw new Error(`Breeze option chain (${right}) error: ${resp.Error}`);
     return resp.Success ?? [];
@@ -252,17 +296,14 @@ export async function fetchNiftyOptionChain(
 
 /**
  * Compute the next Thursday's weekly expiry (Nifty weekly expiry day).
- * Returns ISO string at 06:00:00.000Z (Breeze convention for expiry timestamps).
  */
 export function nextNiftyWeeklyExpiry(now: Date = new Date()): string {
   const d = new Date(now);
   d.setUTCHours(6, 0, 0, 0);
-  // Day of week: 0=Sun ... 4=Thu
   const dow = d.getUTCDay();
   let daysToAdd = (4 - dow + 7) % 7;
-  // If today is Thursday and we're past 09:00 UTC (~14:30 IST = expiry close), use next Thursday
   if (dow === 4 && now.getUTCHours() >= 10) daysToAdd = 7;
-  if (daysToAdd === 0 && dow !== 4) daysToAdd = 7; // safety
+  if (daysToAdd === 0 && dow !== 4) daysToAdd = 7;
   d.setUTCDate(d.getUTCDate() + daysToAdd);
   return d.toISOString().replace(/\.\d{3}Z$/, ".000Z");
 }
@@ -288,27 +329,25 @@ export interface AdvanceDeclineSnapshot {
   unchanged: number;
   errors: number;
   total: number;
-  ratio: number; // advances / max(declines, 1) — internal strength gauge
+  ratio: number;
   bias: "STRONG_UP" | "MODERATE_UP" | "BALANCED" | "MODERATE_DOWN" | "STRONG_DOWN";
-  top_gainers: StockQuote[]; // top 5 by % change
-  top_losers: StockQuote[];  // bottom 5 by % change
+  top_gainers: StockQuote[];
+  top_losers: StockQuote[];
   fetched_at: string;
 }
 
 /**
- * Fetch a single stock quote via Breeze /quotes endpoint.
+ * Fetch a single stock quote via Breeze /quotes endpoint (GET).
  */
 async function fetchOneQuote(breezeCode: string): Promise<{ ltp: number; prev: number } | null> {
   try {
-    const body = {
-      stock_code: breezeCode,
-      exchange_code: "NSE",
-      product_type: "cash",
-    };
-    const resp = await breezeRequest<{ Success?: any[]; Error?: string }>(
-      "GET",
+    const resp = await breezeGet<{ Success?: any[]; Error?: string }>(
       "/quotes",
-      body
+      {
+        stock_code: breezeCode,
+        exchange_code: "NSE",
+        product_type: "cash",
+      }
     );
     if (resp.Error) return null;
     const data = resp.Success?.[0];
@@ -324,12 +363,9 @@ async function fetchOneQuote(breezeCode: string): Promise<{ ltp: number; prev: n
 
 /**
  * Fetch advance/decline snapshot for all Nifty 50 stocks.
- * Runs requests in parallel with bounded concurrency to avoid hitting Breeze rate limits.
  */
 export async function fetchAdvanceDecline(): Promise<AdvanceDeclineSnapshot> {
   const stocks = NIFTY_50_BREEZE_CODES;
-
-  // Bounded concurrency: 10 at a time
   const CONCURRENCY = 10;
   const quotes: StockQuote[] = [];
 
@@ -372,8 +408,7 @@ export async function fetchAdvanceDecline(): Promise<AdvanceDeclineSnapshot> {
   const unchanged = quotes.filter((q) => q.status === "unchanged").length;
   const errors    = quotes.filter((q) => q.status === "error").length;
   const total     = quotes.length;
-
-  const ratio = advances / Math.max(declines, 1);
+  const ratio     = advances / Math.max(declines, 1);
 
   let bias: AdvanceDeclineSnapshot["bias"];
   if (advances >= 40)      bias = "STRONG_UP";
@@ -383,8 +418,8 @@ export async function fetchAdvanceDecline(): Promise<AdvanceDeclineSnapshot> {
   else                     bias = "BALANCED";
 
   const valid = quotes.filter((q) => q.change_pct != null);
-  const top_gainers = [...valid].sort((a, b) => (b.change_pct! - a.change_pct!)).slice(0, 5);
-  const top_losers  = [...valid].sort((a, b) => (a.change_pct! - b.change_pct!)).slice(0, 5);
+  const top_gainers = [...valid].sort((a, b) => b.change_pct! - a.change_pct!).slice(0, 5);
+  const top_losers  = [...valid].sort((a, b) => a.change_pct! - b.change_pct!).slice(0, 5);
 
   return {
     advances, declines, unchanged, errors, total,
